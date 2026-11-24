@@ -1,0 +1,27 @@
+{
+ "version": "0.1.3",
+ "app": {
+  "file": "peet-app-0.1.3.zip",
+  "url": "https://api.github.com/repos/preetkamboj009/peet-edit-app/releases/assets/785848251",
+  "sha256": "d0119ad005f2f25351d517347331a46574c8395ec81bb0f5476b46aa2530ad3c",
+  "size": 200662465
+ },
+ "sfx": [
+  {
+   "pack": "peet-test",
+   "file": "peet-sfx-peet-test-0.1.3.zip",
+   "url": "https://api.github.com/repos/preetkamboj009/peet-edit-app/releases/assets/785848248",
+   "sha256": "9c35e236caf31c52434eb210930755b7b7f4e117258d83cb7f54312adcfa93ed",
+   "size": 190315,
+   "sounds": 4
+  },
+  {
+   "pack": "urfast",
+   "file": "peet-sfx-urfast-0.1.3.zip",
+   "url": "https://api.github.com/repos/preetkamboj009/peet-edit-app/releases/assets/785848256",
+   "sha256": "5a9f439e6d4e865bea23d5000a48efd5d46148ab34986c17d32fa083e9a14d83",
+   "size": 661137317,
+   "sounds": 836
+  }
+ ]
+}

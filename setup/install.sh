@@ -48,7 +48,13 @@ download() {  # download <url|path> <out> [sha256]
   if [ -f "$out" ] && { [ -z "$want" ] || [ "$(sha "$out")" = "$want" ]; }; then return 0; fi
   mkdir -p "$(dirname "$out")"
   for i in 1 2 3; do
-    if [[ "$url" =~ ^https?:// ]]; then curl -L --fail --silent --show-error --retry 3 -C - -o "$out.part" "$url" >>"$LOG" 2>&1
+    local hdr=()
+    if [[ "$url" =~ ^https://api\.github\.com/ ]]; then  # a GitHub release asset: the file itself, not its JSON
+      hdr=(-H "Accept: application/octet-stream")
+      local tok="${PEET_GITHUB_TOKEN:-${GH_TOKEN:-}}"
+      [ -n "$tok" ] && hdr+=(-H "Authorization: Bearer $tok")
+    fi
+    if [[ "$url" =~ ^https?:// ]]; then curl -L --fail --silent --show-error --retry 3 -C - "${hdr[@]}" -o "$out.part" "$url" >>"$LOG" 2>&1
     else cp "$url" "$out.part"; fi
     if [ $? -eq 0 ] && { [ -z "$want" ] || [ "$(sha "$out.part")" = "$want" ]; }; then
       mv -f "$out.part" "$out"; info "got $(basename "$out")"; return 0

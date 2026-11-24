@@ -79,7 +79,13 @@ function Download([string[]]$urls, [string]$out, [string]$sha = '') {
       try {
         if ($u -notmatch '^https?://') { Copy-Item -LiteralPath $u -Destination $part -Force }  # a local release
         else {
-          $r = Native 'curl.exe' @('-L', '--fail', '--silent', '--show-error', '--retry', '3', '-C', '-', '-o', $part, $u)
+          $hdr = @()
+          if ($u -match '^https://api\.github\.com/') {  # a GitHub release asset: the file itself, not its JSON
+            $hdr = @('-H', 'Accept: application/octet-stream')
+            $tok = if ($env:PEET_GITHUB_TOKEN) { $env:PEET_GITHUB_TOKEN } else { $env:GH_TOKEN }
+            if ($tok) { $hdr += @('-H', "Authorization: Bearer $tok") }  # curl drops it on the redirect to storage
+          }
+          $r = Native 'curl.exe' (@('-L', '--fail', '--silent', '--show-error', '--retry', '3', '-C', '-') + $hdr + @('-o', $part, $u))
           $r.out | ForEach-Object { Log "  curl: $_" }
           if ($r.code -ne 0) { throw "curl exit $($r.code)" }
         }
