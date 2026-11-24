@@ -91,7 +91,11 @@ if [ -n "$APP_SOURCE" ]; then
   for d in engine plugin; do mkdir -p "$APP/$d"; rsync -a --delete --exclude __pycache__ --exclude .venv "$APP_SOURCE/$d/" "$APP/$d/" || fail "copy $d"; done
   echo local > "$STATE/app.version"
 elif [ "$HAVE" != "$VER" ] || [ $UPDATE = 1 ] || [ ! -f "$APP/engine/pyproject.toml" ]; then
-  Z="$DL/$(rel app.file)"; download "$(rel app.url)" "$Z" "$(rel app.sha256)"
+  Z="$DL/$(rel app.file)"
+  if [[ "$(rel app.url)" =~ ^https://api\.github\.com/ ]] && [ -z "${PEET_GITHUB_TOKEN:-${GH_TOKEN:-}}" ]; then
+    STEP=licence; finish false '"step": "licence", "licence_error": "LICENCE_REQUIRED", "error": "A licence key is needed to download Peet Edit.", "hint": "Licence keys come with the first public release. Nothing was downloaded."'
+  fi
+  download "$(rel app.url)" "$Z" "$(rel app.sha256)"
   rm -rf "$DL/app-x" && mkdir -p "$DL/app-x" && unzip -q "$Z" -d "$DL/app-x" || fail "could not unpack the app"
   rm -rf "$APP" && mkdir -p "$APP" && mv "$DL/app-x/engine" "$DL/app-x/plugin" "$APP/" || fail "app zip incomplete"
   rm -rf "$Z" "$DL/app-x"; echo "$VER" > "$STATE/app.version"

@@ -161,6 +161,11 @@ try {
     Set-Content $stamp 'local' -Encoding ascii
   } elseif ($have -ne $rel.version -or $Update -or -not (Test-Path (Join-Path $App 'engine\pyproject.toml'))) {
     $z = Join-Path $Dl $rel.app.file
+    if ($rel.app.url -match '^https://api\.github\.com/' -and -not ($env:PEET_GITHUB_TOKEN -or $env:GH_TOKEN)) {
+      # the app lives in a private release: without a licence (Phase 5) or a token there is nothing to download
+      Finish $false @{ step = 'licence'; licence_error = 'LICENCE_REQUIRED'; error = 'A licence key is needed to download Peet Edit.'
+                       hint = 'Licence keys come with the first public release. Nothing was downloaded.' }
+    }
     Download @($rel.app.url) $z $rel.app.sha256
     $x = Join-Path $Dl 'app-x'; Unzip $z $x
     foreach ($d in 'engine', 'plugin') { if (-not (Test-Path (Join-Path $x $d))) { throw "the app zip has no $d folder" } }

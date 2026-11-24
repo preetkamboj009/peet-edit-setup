@@ -35,6 +35,7 @@ it reads `<plugin root>/setup/release.json` (the version and where to download i
      folder>`."
    - `"ok": false` → say plainly which step failed (`step`) and what to do (`hint`), and offer to run setup again
      (it resumes; finished steps are skipped). `"step": "busy"` → another setup is running: wait for it.
+     `"step": "licence"` → a licence key is needed to download Peet Edit; say so plainly (nothing was downloaded).
 5. A setup interrupted by closing Claude or a sleeping PC resumes when run again.
 
 ## Doctor
