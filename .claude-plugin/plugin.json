@@ -1,0 +1,8 @@
+{
+  "name": "peet-setup",
+  "version": "0.1.2",
+  "description": "Installs Peet Edit: the engine, its tools and models, the sound packs and the editing skills.",
+  "author": {
+    "name": "Peet Edit"
+  }
+}

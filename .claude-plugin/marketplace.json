@@ -1,0 +1,8 @@
+{
+  "name": "peet-edit",
+  "owner": {"name": "Peet Edit"},
+  "description": "Peet Edit: edit raw clips into finished reels in your own style, inside Claude",
+  "plugins": [
+    {"name": "peet-setup", "source": "./", "description": "Installs Peet Edit (run /peet-setup:setup once)"}
+  ]
+}

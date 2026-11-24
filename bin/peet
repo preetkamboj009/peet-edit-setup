@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Bash entry to the engine (Git Bash on Windows, macOS). PowerShell uses peet.cmd. Not peet.cmd from Bash: cmd /c
+# strips the quotes and breaks every path with a space in it.
+H="${PEET_HOME:-$HOME/PeetEdit}"
+PY="$H/venv/Scripts/python.exe"
+[ -e "$PY" ] || PY="$H/venv/bin/python"
+if [ ! -e "$PY" ]; then
+  echo '{"ok": false, "error": "ENGINE_MISSING: the engine is not installed. Run /peet:setup"}'
+  exit 1
+fi
+export PEET_HOME="$H" PYTHONUTF8=1
+[ -d "$H/tools/ffmpeg/bin" ] && export PATH="$H/tools/ffmpeg/bin:$PATH"
+# models and the bundled browser live in the home folder when setup put them there
+[ -d "$H/models/hf" ] && export HF_HOME="$H/models/hf"
+export HF_HUB_DISABLE_SYMLINKS_WARNING=1
+[ -d "$H/browsers" ] && export PLAYWRIGHT_BROWSERS_PATH="$H/browsers"
+exec "$PY" -m peet.cli "$@"
