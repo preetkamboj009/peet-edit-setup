@@ -1,8 +1,19 @@
 {
   "name": "peet-edit",
-  "owner": {"name": "Peet Edit"},
-  "description": "Peet Edit: edit raw clips into finished reels in your own style, inside Claude",
+  "owner": {
+    "name": "Peet Edit"
+  },
+  "description": "Peet Edit: build your editing playbook, then edit raw talking-head clips into finished reels.",
   "plugins": [
-    {"name": "peet-setup", "source": "./", "description": "Installs Peet Edit (run /peet-setup:setup once)"}
+    {
+      "name": "peet-setup",
+      "version": "0.7.2",
+      "description": "Installs Peet Edit with your licence key.",
+      "source": {
+        "source": "archive",
+        "sha256": "0b9cf5fcd53c2fbd66d942b278263bb51441dcc89996f881c88c4efc7bac5b73",
+        "url": "https://github.com/preetkamboj009/peet-edit-setup/releases/download/v0.7.2/peet-setup-0.7.2.zip"
+      }
+    }
   ]
 }

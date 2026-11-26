@@ -1,17 +1,46 @@
 #!/usr/bin/env bash
-# Bash entry to the engine (Git Bash on Windows, macOS). PowerShell uses peet.cmd. Not peet.cmd from Bash: cmd /c
-# strips the quotes and breaks every path with a space in it.
-H="${PEET_HOME:-$HOME/PeetEdit}"
-PY="$H/venv/Scripts/python.exe"
-[ -e "$PY" ] || PY="$H/venv/bin/python"
-if [ ! -e "$PY" ]; then
-  echo '{"ok": false, "error": "ENGINE_MISSING: the engine is not installed. Run /peet:setup"}'
+# Shim: run the Peet Edit engine from PEET_HOME.
+home="${PEET_HOME:-${CLAUDE_PLUGIN_OPTION_PEET_HOME:-}}"
+if [ -z "$home" ]; then
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) home="$HOME/Library/Application Support/PeetEdit" ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # same order as core.peet_home / install.ps1: %USERPROFILE%\PeetEdit if it exists, else the 0.6.0 folder in
+      # %LOCALAPPDATA% if it holds an engine, else %USERPROFILE%\PeetEdit (outside AppData: the Claude desktop app is
+      # an MSIX package, and Windows redirects a package's AppData writes)
+      prof="${USERPROFILE:-$HOME}"; prof="${prof//\\//}"
+      legacy="${LOCALAPPDATA:-$prof/AppData/Local}"; legacy="${legacy//\\//}/PeetEdit"
+      home="$prof/PeetEdit"
+      if [ ! -d "$home" ] && { [ -f "$legacy/venv/Scripts/python.exe" ] || [ -f "$legacy/dev-venv/Scripts/python.exe" ]; }; then
+        home="$legacy"
+      fi ;;
+    *) home="${XDG_DATA_HOME:-$HOME/.local/share}/PeetEdit" ;;
+  esac
+fi
+home="${home//\\//}"
+python=""
+for v in venv dev-venv; do
+  for s in Scripts bin; do
+    for e in python.exe python; do
+      if [ -z "$python" ] && [ -f "$home/$v/$s/$e" ]; then python="$home/$v/$s/$e"; fi
+    done
+  done
+done
+if [ -z "$python" ]; then
+  echo '{"ok":false,"error":{"code":"ENGINE_MISSING","hint":"run /peet:setup"}}'
   exit 1
 fi
-export PEET_HOME="$H" PYTHONUTF8=1
-[ -d "$H/tools/ffmpeg/bin" ] && export PATH="$H/tools/ffmpeg/bin:$PATH"
-# models and the bundled browser live in the home folder when setup put them there
-[ -d "$H/models/hf" ] && export HF_HOME="$H/models/hf"
+export PEET_HOME="$home"
+export PLAYWRIGHT_BROWSERS_PATH="$home/browsers"
+export HF_HOME="$home/models/hf"
+export TORCH_HOME="$home/models/torch"
+export MPLCONFIGDIR="$home/cache/matplotlib"
+export PIP_CACHE_DIR="$home/cache/pip"
+mkdir -p "$home/tmp" 2>/dev/null
+if [ -d "$home/tmp" ]; then export TMP="$home/tmp" TEMP="$home/tmp" TMPDIR="$home/tmp"; fi
+[ -d "$home/app" ] && export PEET_APP="$home/app"
 export HF_HUB_DISABLE_SYMLINKS_WARNING=1
-[ -d "$H/browsers" ] && export PLAYWRIGHT_BROWSERS_PATH="$H/browsers"
-exec "$PY" -m peet.cli "$@"
+export PYTHONIOENCODING=utf-8
+export PYTHONUTF8=1
+export PATH="$home/tools/ffmpeg/bin:$PATH"
+exec "$python" -m peet "$@"

@@ -1,8 +1,9 @@
 {
   "name": "peet-setup",
-  "version": "0.1.3",
-  "description": "Installs Peet Edit: the engine, its tools and models, the sound packs and the editing skills.",
+  "version": "0.7.2",
+  "description": "Installs Peet Edit: enter your licence key and setup installs the editor and its skills.",
   "author": {
     "name": "Peet Edit"
-  }
+  },
+  "repository": "https://github.com/preetkamboj009/peet-edit-setup"
 }

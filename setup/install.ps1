@@ -1,315 +1,705 @@
 <#
-  Peet Edit installer (Windows). Everything goes into one folder, PEET_HOME (default %USERPROFILE%\PeetEdit):
-  uv, Python 3.12, the engine and its packages, ffmpeg, the models, Chromium (only if there is no Edge/Chrome),
-  the sound packs, and the skills (copied to Claude's skills folder). No admin rights. Safe to run again: every
-  finished step is skipped, a broken download resumes. Progress lines look like "[3/11] ..."; the last line is JSON.
+  Peet Edit - one-time installer (Windows 10/11, PowerShell 5.1+). No admin rights; nothing outside PEET_HOME except
+  PEET_HOME\bin (the `peet` wrapper) added once to the USER Path, so `peet` works in any new PowerShell or cmd window.
+  Everything it downloads, caches or unpacks (uv, Python, packages, Chromium, models, temp files) stays inside PEET_HOME.
+  Idempotent + resumable: every step checks what is already there. Re-run any time; use -Update to refresh the app.
 
-    -Release <file|url>   release.json (default: the one next to this script)
-    -AppSource <dir>      use an unpacked app folder instead of downloading it (development)
-    -Update               fetch the app and sound packs again even if the version matches
-    -SkipModels           skip the speech model (~1.6 GB; transcribe downloads it on first use)
-    -SkipSounds           skip the sound packs
-    -Home <dir>           install somewhere else than %USERPROFILE%\PeetEdit (env PEET_HOME too)
-    -SkillsDir <dir>      Claude's skills folder (default %USERPROFILE%\.claude\skills)
+  Params / env:
+    -PeetHome   <dir>   PEET_HOME (env PEET_HOME). Default: %USERPROFILE%\PeetEdit if it exists, else the 0.6.0 folder
+                        %LOCALAPPDATA%\PeetEdit if it holds an engine, else %USERPROFILE%\PeetEdit. Not in AppData:
+                        the Claude desktop app is an MSIX package and Windows redirects its AppData writes, which broke uv.
+    -AppSource  <dir>   copy the app from a local checkout instead of the app zip (testing). env PEET_APP_SOURCE
+    -Repo       <url>   override the GitHub repo of the app zip (default: plugin.json "repository"). env PEET_REPO
+    -Update             download the app again and resync the engine (skips big downloads that exist)
+                        The app is always the zip of THIS plugin's version (setup/release.json from the dist build,
+                        sha256-pinned), so the engine and the skills never drift apart. No git anywhere.
+    -SkipModels         skip the ~1.7 GB model downloads (doctor will report them missing)
+    env PEET_LICENCE_KEY    activate this licence key right after the engine step (before the big downloads); a
+                            rejected key stops the install with step "licence" and licence_error = the engine's code.
+                            An unreachable licence server (LICENCE_OFFLINE) never stops it: the downloads go on, the
+                            activation is tried again at the end, and if it still fails the result is ok with
+                            licence_pending = true (setup activates later).
+  Output: one progress line per step ("[n/12] ..."), final line is JSON {"ok":true|false,...}. Log: PEET_HOME\install.log
 #>
-param([string]$Release = '', [string]$AppSource = '', [switch]$Update, [switch]$SkipModels, [switch]$SkipSounds,
-      [Alias('Home')][string]$PeetHome = $env:PEET_HOME, [string]$SkillsDir = '')
+param(
+  [Alias('Home')][string]$PeetHome = $env:PEET_HOME,
+  [string]$AppSource = $env:PEET_APP_SOURCE,
+  [string]$Repo = $env:PEET_REPO,
+  [switch]$Update,
+  [switch]$SkipModels,
+  [string]$SkillsDir = $env:PEET_SKILLS_DIR  # where Claude Code loads skill folders from; default ~/.claude/skills
+)
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-$UV_VERSION = '0.11.23'
-$FFMPEG_NAME = 'ffmpeg-9.0.2-essentials_build'
-$FFMPEG_URLS = @("https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/$FFMPEG_NAME.zip",
-                 "https://www.gyan.dev/ffmpeg/builds/packages/$FFMPEG_NAME.zip")
-$FFMPEG_SHA = '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
-$RVM_URL = 'https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx'
-$RVM_SHA = '88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828'
+# ---- pinned toolchain (docs/BENCHMARKS.md "Toolchain (Phase 0.2)") --------------------------------------------------
+$UV_VERSION   = '0.12.23'
+# ffmpeg: a stable release, gyan.dev "essentials" (static win64: libx264, aac, libwebp, png/mjpeg and every built-in filter
+# the engine uses). The GitHub release tag never expires; gyan.dev serves the identical file (same sha256) as a mirror.
+$FFMPEG_VERSION = '9.0.2'
+$FFMPEG_NAME  = "ffmpeg-$FFMPEG_VERSION-essentials_build"
+$FFMPEG_URLS  = @("https://github.com/GyanD/codexffmpeg/releases/download/$FFMPEG_VERSION/$FFMPEG_NAME.zip",
+                  "https://www.gyan.dev/ffmpeg/builds/packages/$FFMPEG_NAME.zip")
+$FFMPEG_SHA   = '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
+$RVM_URL      = 'https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx'
+$YUNET_URL    = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx'
+$YUNET_SHA    = '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4'
+$FACE_URL     = 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite'
 $WHISPER_REPO = 'mobiuslabsgmbh/faster-whisper-large-v3-turbo'
+# speaker labels for multi-speaker reels (no account/token): pyannote segmentation-3.0 (MIT) + CAM++ (Apache-2.0)
+$SPKSEG_URL   = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2'
+$SPKSEG_SHA   = '24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488'
+$SPKEMB_URL   = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx'
+$SPKEMB_SHA   = '357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b'
+$TOTAL = 12
 
-if (-not $PeetHome) { $PeetHome = Join-Path $env:USERPROFILE 'PeetEdit' }
-$PeetHome = [IO.Path]::GetFullPath($PeetHome)
-if (-not $SkillsDir) {
-  $SkillsDir = if ($env:CLAUDE_CONFIG_DIR) { Join-Path $env:CLAUDE_CONFIG_DIR 'skills' } else { Join-Path $env:USERPROFILE '.claude\skills' }
+# ---- BEGIN home: where PEET_HOME is + the process env (engine/tests/test_home.py runs this block on its own) ---------
+# Same order as the engine's core.peet_home and plugin/bin/peet(.cmd), so the installer and the engine always agree.
+function Get-PeetHomes {
+  $prof = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+  $local = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $prof 'AppData\Local' }
+  return @((Join-Path $prof 'PeetEdit'), (Join-Path $local 'PeetEdit'))  # new, legacy (0.6.0 and earlier)
 }
-if (-not $Release) { $Release = Join-Path $PSScriptRoot 'release.json' }
-$App = Join-Path $PeetHome 'app'; $Tools = Join-Path $PeetHome 'tools'; $Venv = Join-Path $PeetHome 'venv'
-$VenvPy = Join-Path $Venv 'Scripts\python.exe'; $Uv = Join-Path $Tools 'uv\uv.exe'
-$Dl = Join-Path $PeetHome 'scratch\downloads'; $State = Join-Path $PeetHome 'state'; $LogFile = Join-Path $PeetHome 'install.log'
-$TOTAL = 11; $script:Step = 'start'
+function Test-PeetEngine([string]$h) {
+  return ((Test-Path -LiteralPath (Join-Path $h 'venv\Scripts\python.exe') -PathType Leaf) -or
+          (Test-Path -LiteralPath (Join-Path $h 'dev-venv\Scripts\python.exe') -PathType Leaf))
+}
+function Resolve-PeetHome {
+  if ($env:PEET_HOME) { return $env:PEET_HOME }
+  $new, $legacy = Get-PeetHomes
+  if ((Test-Path -LiteralPath $new) -or -not (Test-PeetEngine $legacy)) { return $new }
+  return $legacy
+}
+# Process-scoped env only (the user Path gets PEET_HOME\bin in step 10, nothing else). Every download / cache / scratch
+# folder of uv, pip, Playwright, Hugging Face, torch and the temp dir points inside PEET_HOME, never AppData or %TEMP%.
+function Set-PeetEnv([string]$h) {
+  $tmp = Join-Path $h 'tmp'; New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  $e = [ordered]@{
+    PEET_HOME = $h
+    UV_PYTHON_INSTALL_DIR = Join-Path $h 'python'; UV_PYTHON_BIN_DIR = Join-Path $h 'python\bin'
+    UV_PYTHON_INSTALL_BIN = '0'; UV_PYTHON_INSTALL_REGISTRY = '0'  # no python.exe in ~\.local\bin, no registry entries
+    UV_CACHE_DIR = Join-Path $h 'cache\uv'; UV_TOOL_DIR = Join-Path $h 'tools\uv-tools'; UV_TOOL_BIN_DIR = Join-Path $h 'tools\uv-tools\bin'
+    UV_PYTHON_PREFERENCE = 'only-managed'; UV_LINK_MODE = 'copy'; UV_NO_PROGRESS = '1'; UV_HTTP_TIMEOUT = '120'
+    UV_SYSTEM_CERTS = '1'; NODE_USE_SYSTEM_CA = '1'  # trust the Windows certificate store (antivirus / office proxy roots)
+    PIP_CACHE_DIR = Join-Path $h 'cache\pip'
+    PLAYWRIGHT_BROWSERS_PATH = Join-Path $h 'browsers'
+    HF_HOME = Join-Path $h 'models\hf'; TORCH_HOME = Join-Path $h 'models\torch'; MPLCONFIGDIR = Join-Path $h 'cache\matplotlib'
+    HF_HUB_DISABLE_SYMLINKS_WARNING = '1'
+    TMP = $tmp; TEMP = $tmp
+    PYTHONIOENCODING = 'utf-8'; PYTHONUTF8 = '1'
+  }
+  foreach ($k in $e.Keys) { Set-Item -Path "env:$k" -Value $e[$k] }
+  return $e
+}
+# Earlier installs run from inside the Claude desktop app (an MSIX package) that Windows redirected out of %LOCALAPPDATA%.
+function Find-PackageRedirect {
+  if (-not $env:LOCALAPPDATA) { return @() }
+  $pk = Join-Path $env:LOCALAPPDATA 'Packages'
+  if (-not (Test-Path -LiteralPath $pk)) { return @() }
+  return @(Get-ChildItem -LiteralPath $pk -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue |
+    ForEach-Object { Join-Path $_.FullName 'LocalCache\Local\PeetEdit' } | Where-Object { Test-Path -LiteralPath $_ })
+}
+# ---- END home --------------------------------------------------------------------------------------------------------
 
-# every download, cache and temp file stays inside the home folder
-$env:UV_CACHE_DIR = if ($env:PEET_UV_CACHE) { $env:PEET_UV_CACHE } else { Join-Path $PeetHome 'cache\uv' }
-$env:UV_PYTHON_INSTALL_DIR = Join-Path $PeetHome 'python'
-$env:HF_HOME = Join-Path $PeetHome 'models\hf'
-$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PeetHome 'browsers'
-$env:PEET_HOME = $PeetHome
+# ---- BEGIN preflight: checks before any download (engine/tests/test_install_scripts.py runs this block on its own) --
+# Which Python to install on this PC, or why it can't run. Every engine wheel exists for win_amd64 but not win_arm64, so
+# ARM PCs get the x64 Python (Windows 11 runs it under its built-in emulation; Windows 10 on ARM can't run x64 apps).
+function Get-PlatformPlan([string]$arch, [int]$build) {
+  if ($arch -eq 'ARM64') {
+    if ($build -lt 22000) {
+      return @{ ok = $false; msg = "This PC isn't supported yet: on ARM PCs Peet Edit needs Windows 11 (Windows 10 on ARM can't run its 64-bit video tools)." }
+    }
+    return @{ ok = $true; arm = $true; python = 'cpython-3.12-windows-x86_64-none' }
+  }
+  if ($arch -ne 'AMD64') { return @{ ok = $false; msg = "This PC isn't supported: Peet Edit needs 64-bit Windows 10 or 11." } }
+  return @{ ok = $true; arm = $false; python = 'cpython-3.12-windows-x86_64-none' }
+}
+function Get-MachineArch {
+  $a = @($env:PROCESSOR_ARCHITEW6432, $env:PROCESSOR_ARCHITECTURE)
+  try { $a += (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE } catch {}
+  if ($a -contains 'ARM64') { return 'ARM64' }
+  if ($a -contains 'AMD64') { return 'AMD64' }
+  return [string]$env:PROCESSOR_ARCHITECTURE
+}
+function Get-FreeGB([string]$path) {
+  try { return [math]::Round((New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($path))).AvailableFreeSpace / 1GB, 1) } catch { return $null }
+}
+# One installer at a time: the lock is an open file handle (no other process can open it for writing), so it is released
+# automatically when the installer exits, even if it crashed or the window was closed.
+function Lock-Install([string]$lock) {
+  try { $s = [IO.File]::Open($lock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read) } catch { return $null }
+  $b = [Text.Encoding]::ASCII.GetBytes(("pid {0} started {1}" -f $PID, (Get-Date -Format s)))
+  $s.SetLength(0); $s.Write($b, 0, $b.Length); $s.Flush()
+  return $s
+}
+function Get-RunningStep([string]$log) {
+  try { $m = @(Select-String -LiteralPath $log -Pattern '\[(\d+/\d+)\]' -ErrorAction Stop | Select-Object -Last 1); if ($m) { return $m[0].Matches[0].Groups[1].Value } } catch {}
+  return ''
+}
+# ---- END preflight ---------------------------------------------------------------------------------------------------
 
-function Log([string]$m) { Add-Content -Path $LogFile -Value ("{0} {1}" -f (Get-Date -Format s), $m) -Encoding utf8 }
-function Info([string]$m) { Write-Host "    $m"; Log $m }
-function Step([int]$n, [string]$name, [string]$m) { $script:Step = $name; Write-Host "[$n/$TOTAL] $m"; Log "[$n/$TOTAL] $m" }
-function Finish([bool]$ok, [hashtable]$extra) {
-  Remove-Item (Join-Path $State 'install.lock') -Force -ErrorAction SilentlyContinue
-  $o = @{ ok = $ok; home = $PeetHome } + $extra
-  Write-Host ($o | ConvertTo-Json -Compress -Depth 5)
-  exit $(if ($ok) { 0 } else { 1 })
+$ExplicitHome = [bool]$PeetHome
+if (-not $PeetHome) { $PeetHome = Resolve-PeetHome }
+$Home_ = [IO.Path]::GetFullPath($PeetHome)
+$LegacyHome = [IO.Path]::GetFullPath((Get-PeetHomes)[1])
+$T0 = Get-Date
+$script:Step = 'start'
+$script:N = 0
+New-Item -ItemType Directory -Force -Path $Home_ | Out-Null
+$LogFile = Join-Path $Home_ 'install.log'
+$Dl = Join-Path $Home_ 'scratch\downloads'
+$App = Join-Path $Home_ 'app'
+$Tools = Join-Path $Home_ 'tools'
+$Venv = Join-Path $Home_ 'venv'
+$VenvPy = Join-Path $Venv 'Scripts\python.exe'
+$Uv = Join-Path $Tools 'uv\uv.exe'
+$State = Join-Path $Home_ 'state'
+$AppStamp = Join-Path $State 'app.version'
+New-Item -ItemType Directory -Force -Path $Dl, $State | Out-Null
+
+function Log([string]$m) { try { Add-Content -Path $LogFile -Value ("{0} {1}" -f (Get-Date -Format s), $m) } catch {} }
+function Step([string]$name, [string]$label) {
+  $script:Step = $name; $script:N++
+  $line = "[{0}/{1}] {2}" -f $script:N, $TOTAL, $label
+  Write-Host $line; Log $line
 }
-function Native([string]$exe, [string[]]$a) {
-  # Windows PowerShell 5.1 turns every stderr line of a program into an error, and with 'Stop' that ends the script
-  # (uv prints its progress on stderr). Programs are judged by their exit code only.
-  $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { $out = @(& $exe @a 2>&1 | ForEach-Object { "$_" }); $code = $LASTEXITCODE } finally { $ErrorActionPreference = $old }
-  $global:LASTEXITCODE = 0
-  return @{ out = $out; code = $code }
+function Info([string]$m) { Write-Host "      $m"; Log "      $m" }
+function MB([long]$b) { '{0:N0} MB' -f ($b / 1MB) }
+
+# ---- downloads: curl.exe (in Windows since 10 1803; Schannel, so it trusts the Windows certificate store) with resume
+# (-C - on <out>.part, kept across tries and runs), a 20 s connect timeout and a stall timeout (under 20 KB/s for 60 s).
+$Curl = if ($env:SystemRoot) { Join-Path $env:SystemRoot 'System32\curl.exe' } else { '' }
+if (-not ($Curl -and (Test-Path -LiteralPath $Curl))) { $Curl = '' }
+$TlsHint = 'The secure connection was blocked or re-signed (a certificate problem). The usual cause is antivirus HTTPS / web scanning (Quick Heal, Kaspersky, ESET, Avast web shield) or an office proxy: pause the web protection or use another network (a phone hotspot), then run setup again; it resumes.'
+$ProxyHint = "Couldn't get through this network's proxy. On an office network, use another network (a phone hotspot), then run setup again; it resumes."
+$script:NetHint = ''
+$script:RetryWait = 5
+# 'tls' / 'proxy' / '' from curl's exit code or an error text
+function Get-NetProblem([int]$code, [string]$text) {
+  if (@(35, 51, 53, 54, 58, 59, 60, 77, 80, 83, 90, 91) -contains $code -or $text -match 'SSL|TLS|certificate|trust relationship|secure channel') { return 'tls' }
+  if (@(5, 97) -contains $code -or $text -match 'proxy') { return 'proxy' }
+  return ''
 }
-function Run([string]$exe, [string[]]$a) {
-  Log "> $exe $($a -join ' ')"
-  $r = Native $exe $a
-  $r.out | ForEach-Object { Log "  $_" }
-  if ($r.code -ne 0) { throw "$([IO.Path]::GetFileName($exe)) failed (exit $($r.code)): $(($r.out | Select-Object -Last 3) -join ' ')" }
-  return $r.out
+function Fetch([string]$url, [string]$part) {
+  if ($Curl) {
+    $errFile = "$part.err"
+    & $Curl -fL -sS --connect-timeout 20 --speed-limit 20000 --speed-time 60 -C - --stderr $errFile -o $part $url
+    $code = $LASTEXITCODE; $global:LASTEXITCODE = 0
+    $err = if (Test-Path -LiteralPath $errFile) { @("$(Get-Content -LiteralPath $errFile -Raw)".Trim() -split '\r?\n')[0] } else { '' }
+    Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+    if ($code -eq 0) { return }
+    if (@(33, 36) -contains $code) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }  # can't resume: restart
+    throw (New-Object System.Exception("curl exit ${code}: $err", (New-Object System.Exception([string]$code))))
+  }
+  Invoke-WebRequest -Uri $url -OutFile $part -UseBasicParsing -TimeoutSec 60  # no curl.exe: no resume
 }
-function Sha([string]$p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLower() }
+# Download <urls> (the first, then each mirror) to <out>; with a sha256 every copy must match it. <out> appears only
+# when complete and verified; a partial download stays in <out>.part and the next try (or the next run) resumes it.
 function Download([string[]]$urls, [string]$out, [string]$sha = '') {
-  if ((Test-Path -LiteralPath $out) -and ((-not $sha) -or (Sha $out) -eq $sha)) { return }
-  $part = "$out.part"
-  New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
-  $last = ''
-  foreach ($u in $urls) {
-    for ($i = 1; $i -le 3; $i++) {
+  $dir = Split-Path $out -Parent; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $part = "$out.part"; $last = ''; $problem = ''
+  for ($i = 1; $i -le 3; $i++) {
+    foreach ($url in $urls) {
       try {
-        if ($u -notmatch '^https?://') { Copy-Item -LiteralPath $u -Destination $part -Force }  # a local release
-        else {
-          $hdr = @()
-          if ($u -match '^https://api\.github\.com/') {  # a GitHub release asset: the file itself, not its JSON
-            $hdr = @('-H', 'Accept: application/octet-stream')
-            $tok = if ($env:PEET_GITHUB_TOKEN) { $env:PEET_GITHUB_TOKEN } else { $env:GH_TOKEN }
-            if ($tok) { $hdr += @('-H', "Authorization: Bearer $tok") }  # curl drops it on the redirect to storage
-          }
-          $r = Native 'curl.exe' (@('-L', '--fail', '--silent', '--show-error', '--retry', '3', '-C', '-') + $hdr + @('-o', $part, $u))
-          $r.out | ForEach-Object { Log "  curl: $_" }
-          if ($r.code -ne 0) { throw "curl exit $($r.code)" }
+        Fetch $url $part
+        if ($sha) {
+          $got = (Get-FileHash -Algorithm SHA256 -Path $part).Hash.ToLower()
+          if ($got -ne $sha.ToLower()) { Remove-Item -LiteralPath $part -Force; throw "sha256 mismatch for $(Split-Path $out -Leaf): expected $sha got $got" }
         }
-        if ($sha -and (Sha $part) -ne $sha) { Remove-Item $part -Force; throw 'checksum mismatch' }
-        Move-Item -Force $part $out
-        Info ("got {0} ({1:N0} MB)" -f (Split-Path $out -Leaf), ((Get-Item -LiteralPath $out).Length / 1MB))
+        Move-Item -LiteralPath $part $out -Force
+        Info ("downloaded {0} ({1})" -f (Split-Path $out -Leaf), (MB (Get-Item -LiteralPath $out).Length))
         return
-      } catch { $last = $_.Exception.Message; Log "download try $i failed ($u): $last"; $global:LASTEXITCODE = 0 }
+      } catch {
+        $last = $_.Exception.Message
+        $code = 0; if ($_.Exception.InnerException) { [void][int]::TryParse($_.Exception.InnerException.Message, [ref]$code) }
+        $p = Get-NetProblem $code $last; if ($p) { $problem = $p }
+        Log "download attempt $i failed ($url): $last"
+      }
+    }
+    if ($i -lt 3) { Info "network hiccup, retrying ($i/3)..."; Start-Sleep -Seconds ($script:RetryWait * $i) }
+  }
+  if ($problem -eq 'tls') { $script:NetHint = $TlsHint } elseif ($problem -eq 'proxy') { $script:NetHint = $ProxyHint }
+  throw "download failed after 3 tries: $($urls[0]) ($last)"
+}
+# The licence key for the app download: the one passed to setup, else the one already activated on this computer (update).
+function Get-LicenceKey {
+  if ($env:PEET_LICENCE_KEY) { return $env:PEET_LICENCE_KEY.Trim() }
+  $lf = Join-Path $Home_ 'licence.json'
+  if (Test-Path -LiteralPath $lf) { try { $k = [string]((Get-Content -LiteralPath $lf -Raw | ConvertFrom-Json).key); if ($k) { return $k.Trim() } } catch {} }
+  return ''
+}
+# Ask the licence server for a download link (valid a few minutes). The answer: {ok, url, sha256, version} or, for a
+# key it refuses, {ok:false, error, hint}. A server that can't be reached throws (the caller retries).
+function Request-AppLink($rel, [string]$key, [string]$file = '') {
+  $b = @{ key = $key; version = $rel.version }; if ($file) { $b.file = $file }  # $file: another asset of the release (a sound pack)
+  $body = $b | ConvertTo-Json -Compress
+  try {
+    return Invoke-RestMethod -Method Post -Uri $rel.download -ContentType 'application/json' -Body $body -TimeoutSec 30 -UseBasicParsing
+  } catch {
+    $raw = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { '' }
+    if (-not $raw -and $_.Exception.Response) { try { $raw = (New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())).ReadToEnd() } catch {} }
+    $j = $null; if ($raw) { try { $j = $raw | ConvertFrom-Json } catch {} }
+    if ($j -and $j.error) { return $j }
+    throw (New-Object System.Exception("the licence server couldn't be reached: $($_.Exception.Message)"))
+  }
+}
+# Download the app zip through the licence server: every try gets a fresh link (an expired one fails with an HTTP
+# error and the next try resumes the same .part file). A refused key stops here, with nothing downloaded.
+function Download-Gated($rel, [string]$key, [string]$out, [string]$file = '') {
+  $dir = Split-Path $out -Parent; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $part = "$out.part"; $last = ''; $problem = ''
+  for ($i = 1; $i -le 4; $i++) {
+    try {
+      $g = Request-AppLink $rel $key $file
+      if (-not $g.ok) { return $g }
+      Fetch ([string]$g.url) $part
+      if ($g.sha256) {
+        $got = (Get-FileHash -Algorithm SHA256 -Path $part).Hash.ToLower()
+        if ($got -ne ([string]$g.sha256).ToLower()) { Remove-Item -LiteralPath $part -Force; throw "sha256 mismatch for $(Split-Path $out -Leaf): expected $($g.sha256) got $got" }
+      }
+      Move-Item -LiteralPath $part $out -Force
+      Info ("downloaded {0} ({1})" -f (Split-Path $out -Leaf), (MB (Get-Item -LiteralPath $out).Length))
+      return $null
+    } catch {
+      $last = $_.Exception.Message
+      $code = 0; if ($_.Exception.InnerException) { [void][int]::TryParse($_.Exception.InnerException.Message, [ref]$code) }
+      $p = Get-NetProblem $code $last; if ($p) { $problem = $p }
+      Log "app download attempt $i failed: $last"
+    }
+    if ($i -lt 4) { Info "network hiccup, retrying ($i/3)..."; Start-Sleep -Seconds ($script:RetryWait * $i) }
+  }
+  if ($problem -eq 'tls') { $script:NetHint = $TlsHint } elseif ($problem -eq 'proxy') { $script:NetHint = $ProxyHint }
+  throw "download failed after 4 tries ($last)"
+}
+# uv, curl and Python don't read the Windows (WinINET) proxy setting: hand it to them as HTTPS_PROXY when one is set
+function Set-SystemProxy {
+  if ($env:HTTPS_PROXY -or $env:https_proxy) { return }
+  try {
+    $u = [Uri]'https://github.com'; $p = [Net.WebRequest]::GetSystemWebProxy().GetProxy($u)
+    if ($p -and $p.Host -ne $u.Host) { $env:HTTPS_PROXY = $p.AbsoluteUri; $env:HTTP_PROXY = $p.AbsoluteUri; Log "using the system proxy $($p.Authority)" }
+  } catch {}
+}
+# keep the PC awake while the installer runs (ES_CONTINUOUS | ES_SYSTEM_REQUIRED; Windows drops it when the process ends)
+function Set-StayAwake([bool]$on) {
+  if (-not $on -and -not ('Peet.Power' -as [type])) { return }
+  try {
+    if (-not ('Peet.Power' -as [type])) {
+      Add-Type -Namespace Peet -Name Power -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);' -ErrorAction Stop
+    }
+    [void][Peet.Power]::SetThreadExecutionState($(if ($on) { [uint32]2147483649 } else { [uint32]2147483648 }))
+  } catch {}
+}
+function Run([string]$exe, [string[]]$argv) {
+  Log ("RUN {0} {1}" -f $exe, ($argv -join ' '))
+  & $exe @argv
+  if ($LASTEXITCODE -ne 0) { throw "$(Split-Path $exe -Leaf) exited with code $LASTEXITCODE" }
+}
+function Retry([scriptblock]$sb, [string]$what) {
+  for ($i = 1; $i -le 3; $i++) {
+    try { & $sb; return } catch {
+      Log "$what attempt $i failed: $($_.Exception.Message)"
+      if ($i -eq 3) { throw }
+      Info "$what failed, retrying ($i/3)..."; Start-Sleep -Seconds (3 * $i)
     }
   }
-  throw "download failed: $($urls[0]) ($last)"
 }
-function Unzip([string]$z, [string]$to) {
-  if (Test-Path $to) { Remove-Item $to -Recurse -Force }
-  New-Item -ItemType Directory -Force -Path $to | Out-Null
-  $r = Native 'tar.exe' @('-xf', $z, '-C', $to)  # Windows 10 1803+ ships bsdtar; much faster than Expand-Archive
-  if ($r.code -ne 0) { throw "could not unpack $(Split-Path $z -Leaf): $($r.out -join ' ')" }
+function Unzip([string]$zip, [string]$dest) {
+  if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+  [IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)
 }
-function Has-Browser {
-  $c = @("$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe", "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-         "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-         "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe")
-  return [bool]($c | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1)
+function HashOf([string[]]$files) {
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($f in $files) { if (Test-Path $f) { [void]$sb.Append((Get-FileHash -Algorithm SHA256 -Path $f).Hash) } }
+  return $sb.ToString()
+}
+# `peet` in any new PowerShell / cmd window: a stable wrapper in PEET_HOME\bin (the plugin folder moves with every
+# update, PEET_HOME doesn't) and that folder on the USER Path (HKCU, no admin). Idempotent: never added twice.
+function Install-PeetWrapper([string]$h) {
+  $bin = Join-Path $h 'bin'; New-Item -ItemType Directory -Force -Path $bin | Out-Null
+  $src = @((Join-Path $PSScriptRoot '..\bin\peet.cmd'), (Join-Path $h 'app\plugin\bin\peet.cmd')) | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($src) {
+    $txt = [IO.File]::ReadAllText((Resolve-Path $src).Path)
+    # the installed folder replaces the default-home lookup (and the lookup itself is dropped)
+    $txt = $txt.Replace('if "%H%"=="" call :defaulthome', ('if "%H%"=="" set "H={0}"' -f $h))
+    $txt = [regex]::Replace($txt, '(?s)(\r?\n)rem Default PEET_HOME.*$', '$1')
+  } else {
+    $txt = "@echo off`r`nsetlocal`r`nset `"H=%PEET_HOME%`"`r`nif `"%H%`"==`"`" set `"H=$h`"`r`n" +
+           "set `"PEET_HOME=%H%`"`r`nset `"PLAYWRIGHT_BROWSERS_PATH=%H%\browsers`"`r`nset `"HF_HOME=%H%\models\hf`"`r`n" +
+           "set `"TORCH_HOME=%H%\models\torch`"`r`nif not exist `"%H%\tmp\`" mkdir `"%H%\tmp`" >nul 2>&1`r`n" +
+           "set `"TMP=%H%\tmp`"`r`nset `"TEMP=%H%\tmp`"`r`n" +
+           "if exist `"%H%\app`" set `"PEET_APP=%H%\app`"`r`nset `"PYTHONIOENCODING=utf-8`"`r`nset `"PYTHONUTF8=1`"`r`n" +
+           "set `"PATH=%H%\tools\ffmpeg\bin;%PATH%`"`r`n`"%H%\venv\Scripts\python.exe`" -m peet %*`r`nexit /b %ERRORLEVEL%`r`n"
+  }
+  [IO.File]::WriteAllText((Join-Path $bin 'peet.cmd'), $txt, (New-Object System.Text.UTF8Encoding($false)))
+  return $bin
+}
+function Add-UserPath([string]$dir, [string]$keyName = 'Environment') {
+  $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($keyName)
+  try {
+    $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $want = $dir.TrimEnd('\').ToLowerInvariant()
+    $parts = @($raw -split ';' | Where-Object { $_.Trim() -ne '' })
+    foreach ($p in $parts) { if ([Environment]::ExpandEnvironmentVariables($p).Trim().TrimEnd('\').ToLowerInvariant() -eq $want) { return $false } }
+    $key.SetValue('Path', ((@($parts) + $dir) -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+  } finally { $key.Close() }
+  # tell Explorer and new terminals that the environment changed (SetEnvironmentVariable broadcasts WM_SETTINGCHANGE)
+  if ($keyName -eq 'Environment') { try { [Environment]::SetEnvironmentVariable('PEET_PATH_REFRESH', $null, 'User') } catch {} }
+  return $true
+}
+function Remove-UserPath([string]$dir, [string]$keyName = 'Environment') {
+  $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($keyName)
+  try {
+    $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $drop = $dir.TrimEnd('\').ToLowerInvariant()
+    $parts = @($raw -split ';' | Where-Object { $_.Trim() -ne '' })
+    $keep = @($parts | Where-Object { [Environment]::ExpandEnvironmentVariables($_).Trim().TrimEnd('\').ToLowerInvariant() -ne $drop })
+    if ($keep.Count -eq $parts.Count) { return $false }
+    $key.SetValue('Path', ($keep -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+  } finally { $key.Close() }
+  if ($keyName -eq 'Environment') { try { [Environment]::SetEnvironmentVariable('PEET_PATH_REFRESH', $null, 'User') } catch {} }
+  return $true
+}
+# The app zip that matches THIS plugin's version: setup/release.json (written by tools/make_dist.py, with the zip's
+# sha256), else the release asset named after plugin.json's version (a local build without release.json; no sha).
+function Get-AppRelease {
+  $rj = Join-Path $PSScriptRoot 'release.json'
+  if (Test-Path -LiteralPath $rj) {
+    $r = Get-Content -LiteralPath $rj -Raw | ConvertFrom-Json
+    if ($r.download) { return @{ version = [string]$r.version; gated = $true; download = [string]$r.download; urls = @(); sha = ''; sfx = @($r.sfx | Where-Object { $_ }) } }
+    return @{ version = [string]$r.version; urls = @($r.app_urls); sha = [string]$r.app_sha256 }
+  }
+  $p = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\.claude-plugin\plugin.json') -Raw | ConvertFrom-Json
+  $r = if ($Repo) { $Repo } else { [string]$p.repository }
+  if ($r -notmatch '^https?://') { $r = "https://github.com/$r" }
+  $r = $r.TrimEnd('/'); if ($r.EndsWith('.git')) { $r = $r.Substring(0, $r.Length - 4) }
+  $v = [string]$p.version
+  return @{ version = $v; urls = @("$r/releases/download/v$v/peet-app-$v.zip"); sha = '' }
+}
+# Activate PEET_LICENCE_KEY with the engine: $null when activated, else the engine's error {code, message, hint}.
+function Invoke-Licence {
+  $lic = & $VenvPy -m peet licence activate --key $env:PEET_LICENCE_KEY
+  $global:LASTEXITCODE = 0
+  $lj = $null; try { $lj = (@($lic) | Select-Object -Last 1) | ConvertFrom-Json } catch {}
+  if ($lj -and $lj.ok) { Info $lj.message; return $null }
+  if ($lj -and $lj.error) { return $lj.error }
+  return @{ code = 'UNEXPECTED'; message = "licence activation gave no answer: $lic"; hint = 'Re-run setup.' }
+}
+function Finish([bool]$ok, [hashtable]$extra) {
+  Set-StayAwake $false
+  $o = [ordered]@{ ok = $ok; home = $Home_; seconds = [int]((Get-Date) - $T0).TotalSeconds; log = $LogFile }
+  foreach ($k in $extra.Keys) { $o[$k] = $extra[$k] }
+  Write-Output ($o | ConvertTo-Json -Compress -Depth 6)
+  if ($ok) { exit 0 } else { exit 1 }
 }
 
+Set-PeetEnv $Home_ | Out-Null
+
 $hint = @{
-  platform = 'Peet Edit needs 64-bit Windows 10 or 11.'; disk = 'Free up space, then run setup again.'
-  app = 'Check the internet connection and run setup again; it resumes.'; uv = 'Check the internet connection and run setup again.'
-  python = 'Run setup again; if it keeps failing, restart the PC (a stuck download or antivirus).'
-  engine = 'Run setup again; downloads resume. Antivirus HTTPS scanning or an office proxy can block packages.'
-  ffmpeg = 'Run setup again; the download resumes.'; browser = 'Install Google Chrome, then run setup again.'
-  models = 'Run setup again; finished downloads are kept.'; sounds = 'Run setup again; finished packs are kept.'
-  skills = 'Close Claude, run setup again.'; doctor = 'Run setup again, or tell us what doctor says.'
+  licence = 'Check the key from your purchase email and run setup again.'
+  skills = 'Check that your Claude skills folder (~\.claude\skills) is writable, then run setup again.'
+  home = 'Check that the folder is writable and the disk has about 6 GB free.'
+  app = "Couldn't download the app. Check the internet connection (on Jio, try another network or a phone hotspot) and run setup again; it resumes."
+  uv = 'Check your internet connection and re-run; the installer resumes where it stopped.'
+  python = 'Check your internet connection and re-run. If the error mentions a certificate, antivirus HTTPS scanning or an office proxy is the likely cause.'
+  engine = 'Re-run the installer (it resumes). If the error mentions a certificate, antivirus HTTPS scanning or an office proxy is the likely cause; otherwise send the last lines of install.log.'
+  ffmpeg = 'Check your internet connection and re-run (the download is checksum-verified).'
+  browser = 'Check your internet connection and re-run. If the error mentions a certificate, antivirus HTTPS scanning or an office proxy is the likely cause.'
+  sounds = 'Check your internet connection and re-run; a finished sound pack is kept and a partial one resumes.'
+  models = 'Check your internet connection and re-run; finished and partial downloads are kept. If the error mentions a certificate, antivirus HTTPS scanning or an office proxy is the likely cause.'
+  playbooks = 'Check that PEET_HOME is writable.'
+  doctor = 'Run `peet doctor` and follow the hint on the failing check.'
 }
 
 try {
-  New-Item -ItemType Directory -Force -Path $PeetHome, $State, $Dl, $Tools | Out-Null
-  $lock = Join-Path $State 'install.lock'
-  if (Test-Path $lock) {
-    $pidOld = [int]((Get-Content $lock -Raw).Trim())
-    if (Get-Process -Id $pidOld -ErrorAction SilentlyContinue) {
-      Finish $false @{ step = 'busy'; error = 'Another Peet Edit setup is already running.'; hint = 'Let it finish (install.log shows its progress).' }
-    }
+  # ---- 1 home: one installer at a time, then platform + disk checks, all before any download ------------------------
+  $script:LockStream = Lock-Install (Join-Path $State 'install.lock')
+  if (-not $script:LockStream) {
+    $at = Get-RunningStep $LogFile
+    $msg = 'Another Peet Edit install is already running' + $(if ($at) { " (now at step $at)" } else { '' }) + '.'
+    Write-Host $msg
+    Finish $false @{ step = 'busy'; running = $true; error = $msg; hint = 'Let it finish (its progress is in install.log); run setup again only if it stops.' }
   }
-  Set-Content -Path $lock -Value $PID -Encoding ascii
-  Log "---- setup start: home=$PeetHome update=$Update"
+  Step 'home' "Preparing $Home_"
+  Set-StayAwake $true
+  Set-SystemProxy
+  $plan = Get-PlatformPlan (Get-MachineArch) ([Environment]::OSVersion.Version.Build)
+  if (-not $plan.ok) {
+    Write-Host $plan.msg; Log $plan.msg
+    Finish $false @{ step = 'platform'; error = $plan.msg; hint = 'Nothing was downloaded or changed.' }
+  }
+  if ($plan.arm) { Info 'Windows on ARM: installing the x64 versions (they run under Windows 11 built-in emulation)' }
+  $needGB = if (Test-Path $VenvPy) { 2 } else { 6 }  # first install peaks at ~5-6 GB (downloads + uv cache); a resume needs less
+  $freeGB = Get-FreeGB $Home_
+  if (($null -ne $freeGB) -and ($freeGB -lt $needGB)) {
+    $msg = "Not enough free disk space: setup needs about $needGB GB free on $([IO.Path]::GetPathRoot($Home_)) and there is $freeGB GB."
+    Write-Host $msg; Log $msg
+    Finish $false @{ step = 'disk'; error = $msg; hint = 'Free up some space (empty the Recycle Bin, delete big downloads), then run setup again.' }
+  }
+  if ((-not $ExplicitHome) -and ($Home_ -eq $LegacyHome)) { Info 'keeping your existing install in this folder (Peet Edit 0.6.0 and earlier)' }
+  foreach ($r in (Find-PackageRedirect)) {
+    Info "an earlier install from inside the Claude app was redirected by Windows to $r; this install doesn't use it (you can delete that folder)"
+  }
+  foreach ($d in 'tools', 'browsers', 'models\rvm', 'models\mediapipe', 'models\yunet', 'models\hf', 'playbooks', 'scratch', 'cache', 'sfx') {  # sfx = on-demand sound cache (peet sfx fetch)
+    New-Item -ItemType Directory -Force -Path (Join-Path $Home_ $d) | Out-Null
+  }
 
-  # ---- 1 checks -------------------------------------------------------------------------------------------------
-  Step 1 'platform' "Checking this PC ($PeetHome)"
-  if (-not [Environment]::Is64BitOperatingSystem -or [Environment]::OSVersion.Version.Major -lt 10) {
-    Finish $false @{ step = 'platform'; error = 'Peet Edit needs 64-bit Windows 10 or 11.'; hint = $hint.platform }
-  }
-  $need = if (Test-Path $VenvPy) { 2 } else { 6 }
-  $free = [math]::Round((Get-PSDrive -Name ($PeetHome.Substring(0, 1))).Free / 1GB, 1)
-  if ($free -lt $need) {
-    Finish $false @{ step = 'disk'; error = "Setup needs about $need GB free on $($PeetHome.Substring(0, 2)); there is $free GB."; hint = $hint.disk }
-  }
-  $rel = if ($Release -match '^https?://') { Invoke-RestMethod -Uri $Release -UseBasicParsing } else { Get-Content -Raw $Release | ConvertFrom-Json }
-  $gpu = [bool](Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue)
-  Info "release $($rel.version); NVIDIA GPU: $gpu"
-
-  # ---- 2 app ----------------------------------------------------------------------------------------------------
-  Step 2 'app' "The Peet Edit app $($rel.version) (engine, skills, styles)"
-  $stamp = Join-Path $State 'app.version'
-  $have = if (Test-Path $stamp) { (Get-Content $stamp -Raw).Trim() } else { '' }
+  # ---- 2 app ---------------------------------------------------------------------------------------------------
+  Step 'app' 'Getting the Peet Edit app (engine, renderer, playbooks, assets)'
+  $appDirs = 'engine', 'renderer', 'playbooks', 'assets', 'plugin'
+  $before = HashOf @((Join-Path $App 'engine\pyproject.toml'), (Join-Path $App 'engine\uv.lock'))
   if ($AppSource) {
-    Info "copying from $AppSource"
-    foreach ($d in 'engine', 'plugin') {
-      & robocopy (Join-Path $AppSource $d) (Join-Path $App $d) /MIR /NFL /NDL /NJH /NJS /NP /XD __pycache__ .venv | Out-Null
-      if ($LASTEXITCODE -ge 8) { throw "robocopy $d failed ($LASTEXITCODE)" }
+    $src = (Resolve-Path $AppSource).Path
+    Info "copying from local source $src"
+    foreach ($d in $appDirs) {
+      $s = Join-Path $src $d; $t = Join-Path $App $d
+      if (-not (Test-Path $s)) { throw "$s not found in -AppSource" }
+      & robocopy $s $t /MIR /NFL /NDL /NJH /NJS /NP /XD .git __pycache__ .pytest_cache .venv node_modules inspiration /XF *.mp4 *.mov *.mkv *.wav *.m4a *.onnx *.bin | Out-Null
+      if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($d) code $LASTEXITCODE" }
     }
     $global:LASTEXITCODE = 0
-    Set-Content $stamp 'local' -Encoding ascii
-  } elseif ($have -ne $rel.version -or $Update -or -not (Test-Path (Join-Path $App 'engine\pyproject.toml'))) {
-    $z = Join-Path $Dl $rel.app.file
-    if ($rel.app.url -match '^https://api\.github\.com/' -and -not ($env:PEET_GITHUB_TOKEN -or $env:GH_TOKEN)) {
-      # the app lives in a private release: without a licence (Phase 5) or a token there is nothing to download
-      Finish $false @{ step = 'licence'; licence_error = 'LICENCE_REQUIRED'; error = 'A licence key is needed to download Peet Edit.'
-                       hint = 'Licence keys come with the first public release. Nothing was downloaded.' }
+    Set-Content -Path $AppStamp -Value 'local source' -Encoding ascii
+  } else {
+    $rel = Get-AppRelease
+    $key = ''
+    if ($rel.gated) {  # the app is only for a licence key: no key, nothing is downloaded
+      $key = Get-LicenceKey
+      if (-not $key) {
+        $msg = 'A licence key is needed to install Peet Edit.'
+        Write-Host $msg; Log $msg
+        Finish $false @{ step = 'licence'; licence_error = 'LICENCE_REQUIRED'; error = $msg; hint = 'Run setup again with the key from your purchase email. Nothing was downloaded.' }
+      }
     }
-    Download @($rel.app.url) $z $rel.app.sha256
-    $x = Join-Path $Dl 'app-x'; Unzip $z $x
-    foreach ($d in 'engine', 'plugin') { if (-not (Test-Path (Join-Path $x $d))) { throw "the app zip has no $d folder" } }
-    if (Test-Path $App) { Remove-Item $App -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $App | Out-Null
-    Move-Item (Join-Path $x 'engine'), (Join-Path $x 'plugin') $App
-    Remove-Item $z, $x -Recurse -Force
-    Set-Content $stamp $rel.version -Encoding ascii
-  } else { Info "app $($rel.version) already in place" }
+    $complete = @($appDirs | Where-Object { -not (Test-Path (Join-Path $App $_)) }).Count -eq 0
+    $have = if (Test-Path $AppStamp) { (Get-Content $AppStamp -Raw).Trim() } else { '' }
+    if ($complete -and $have -eq $rel.version -and -not $Update) { Info "app $($rel.version) already in place" } else {
+      Info "downloading the app (version $($rel.version))"
+      $z = Join-Path $Dl "peet-app-$($rel.version).zip"; $x = Join-Path $Dl 'app-x'
+      if ($rel.gated) {
+        $refused = Download-Gated $rel $key $z
+        if ($refused) {
+          $msg = if ($refused.hint) { [string]$refused.hint } else { "The licence server refused the download ($($refused.error))." }
+          Write-Host $msg; Log "app download refused: $($refused.error)"
+          Finish $false @{ step = 'licence'; licence_error = [string]$refused.error; error = $msg; hint = 'Check the key from your purchase email and run setup again. Nothing else was downloaded.' }
+        }
+      } else { Download $rel.urls $z $rel.sha }
+      Unzip $z $x
+      $top = Get-ChildItem $x | Select-Object -First 1
+      if (Test-Path $App) { Remove-Item $App -Recurse -Force }
+      New-Item -ItemType Directory -Force -Path $App | Out-Null
+      foreach ($d in $appDirs) { $sd = Join-Path $top.FullName $d; if (Test-Path $sd) { Copy-Item -Recurse -Force $sd (Join-Path $App $d) } }
+      Remove-Item $z, $x -Recurse -Force
+      Set-Content -Path $AppStamp -Value $rel.version -Encoding ascii
+    }
+  }
+  foreach ($d in ($appDirs | Where-Object { $_ -ne 'plugin' })) { if (-not (Test-Path (Join-Path $App $d))) { throw "app is incomplete: $d missing" } }
+  $after = HashOf @((Join-Path $App 'engine\pyproject.toml'), (Join-Path $App 'engine\uv.lock'))
+  Info ("app ready at {0}" -f $App)
 
-  # ---- 3 uv -----------------------------------------------------------------------------------------------------
-  Step 3 'uv' "uv $UV_VERSION (Python manager)"
+  # ---- 3 uv ----------------------------------------------------------------------------------------------------
+  Step 'uv' "uv $UV_VERSION (Python manager)"
   $uvOk = $false
   if (Test-Path $Uv) { try { $uvOk = ((& $Uv --version) -match [regex]::Escape($UV_VERSION)) } catch {} }
   if ($uvOk) { Info 'already installed' } else {
-    $asset = 'uv-x86_64-pc-windows-msvc.zip'
+    $asset = 'uv-x86_64-pc-windows-msvc.zip'  # x64 on every PC (ARM PCs run it under emulation, like the x64 Python)
     $base = "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$asset"
-    $shaFile = Join-Path $Dl "$asset.sha256"
-    Remove-Item $shaFile -Force -ErrorAction SilentlyContinue
-    Download @("$base.sha256") $shaFile
     $z = Join-Path $Dl $asset
-    Download @($base) $z (((Get-Content -Raw $shaFile).Trim() -split '\s+')[0])
+    $shaFile = Join-Path $Dl "$asset.sha256"
+    if (Test-Path $shaFile) { Remove-Item $shaFile -Force }
+    Download "$base.sha256" $shaFile
+    $sha = ((Get-Content -LiteralPath $shaFile -Raw).Trim() -split '\s+')[0]
+    Download $base $z $sha
     $x = Join-Path $Dl 'uv-x'; Unzip $z $x
     New-Item -ItemType Directory -Force -Path (Join-Path $Tools 'uv') | Out-Null
     $exe = Get-ChildItem $x -Recurse -Filter uv.exe | Select-Object -First 1
     Copy-Item (Join-Path $exe.DirectoryName '*') (Join-Path $Tools 'uv') -Force
     Remove-Item $z, $x -Recurse -Force
   }
+  if (-not (Test-Path $Uv)) { throw 'uv.exe missing after install' }
 
-  # ---- 4 python -------------------------------------------------------------------------------------------------
-  Step 4 'python' 'Python 3.12 and a virtual environment'
+  # ---- 4 python + venv -----------------------------------------------------------------------------------------
+  Step 'python' 'Python 3.12 + virtual environment (~70 MB)'
+  # a working venv needs nothing here (an update never touches the Python folder or its links)
   $pyOk = $false
-  if (Test-Path $VenvPy) { try { $pyOk = ((& $VenvPy -c "import sys; print(sys.version_info[:2] == (3, 12))") -eq 'True') } catch {}; $global:LASTEXITCODE = 0 }
-  if ($pyOk) { Info 'already in place' } else {
-    if (Test-Path $Venv) { Remove-Item $Venv -Recurse -Force }
-    Run $Uv @('python', 'install', '3.12') | Out-Null
-    Run $Uv @('venv', $Venv, '--python', '3.12') | Out-Null
+  # an x64 Python 3.12 (win-amd64: the platform every engine wheel exists for, also on ARM PCs)
+  if (Test-Path $VenvPy) { try { $pyOk = ((& $VenvPy -c "import sys, sysconfig; print(sys.version_info[:2] == (3, 12) and sysconfig.get_platform() == 'win-amd64')") -eq 'True') } catch {}; $global:LASTEXITCODE = 0 }
+  if ($pyOk) { Info 'Python 3.12 already installed' } else {
+    if (Test-Path $Venv) { Remove-Item $Venv -Recurse -Force }  # a broken or ARM venv is rebuilt
+    Retry { Run $Uv @('python', 'install', $plan.python) } 'python download'
+  }
+  if (-not (Test-Path $VenvPy)) { Run $Uv @('venv', $Venv, '--python', $plan.python) } else { Info 'venv already exists' }
+
+  # ---- 5 engine ------------------------------------------------------------------------------------------------
+  Step 'engine' 'Installing the peet engine and its packages (~700 MB)'
+  $stamp = Join-Path $State 'engine.sha'
+  $have = if (Test-Path $stamp) { (Get-Content $stamp -Raw).Trim() } else { '' }
+  # Always sync to EXACTLY the locked set (removes extras, restores changed versions); a no-op when already matching.
+  $req = Join-Path $Dl 'requirements.txt'
+  Run $Uv @('export', '--project', (Join-Path $App 'engine'), '--frozen', '--no-dev', '--no-emit-project', '--no-hashes', '-o', $req, '-q')
+  # --no-build: binary wheels only, so nothing is ever compiled (no compiler needed; a missing wheel fails plainly)
+  Retry { Run $Uv @('pip', 'sync', '--no-build', '--python', $VenvPy, $req) } 'package sync'
+  # editable: the engine locates renderer/, assets/, playbooks/ relative to app/engine/src, so it must run from app/
+  Retry { Run $Uv @('pip', 'install', '--python', $VenvPy, '--no-deps', '-e', (Join-Path $App 'engine')) } 'engine install'
+  Remove-Item $req -Force -ErrorAction SilentlyContinue
+  Set-Content -Path $stamp -Value $after -Encoding ascii
+
+  # licence: activate as soon as the engine exists, before the big downloads (key from the setup skill, env only). A
+  # wrong key stops here; an unreachable licence server doesn't: the install goes on and tries again at the end.
+  $licPending = $false
+  if ($env:PEET_LICENCE_KEY) {
+    $script:Step = 'licence'
+    Info 'activating your licence'
+    $le = Invoke-Licence
+    if ($le -and $le.code -eq 'LICENCE_OFFLINE') {
+      $licPending = $true; Log 'licence server unreachable; activation retried at the end'
+      Info "couldn't reach the licence server; carrying on with the install and trying again at the end"
+    } elseif ($le) {
+      Log "licence activation failed: $($le.code)"
+      Write-Host "FAILED at step 'licence': $($le.message)"
+      Finish $false @{ step = 'licence'; licence_error = $le.code; error = $le.message; hint = $le.hint }
+    }
+    $script:Step = 'engine'
   }
 
-  # ---- 5 engine -------------------------------------------------------------------------------------------------
-  Step 5 'engine' $(if ($gpu) { 'The engine and its packages, with NVIDIA GPU support (~1.5 GB)' } else { 'The engine and its packages (~500 MB)' })
-  $req = Join-Path $Dl 'requirements.txt'
-  $exp = @('export', '--project', (Join-Path $App 'engine'), '--frozen', '--no-dev', '--no-emit-project', '--no-hashes', '-q', '-o', $req)
-  if ($gpu) { $exp += @('--extra', 'gpu') }
-  Run $Uv $exp | Out-Null
-  Run $Uv @('pip', 'sync', '--python', $VenvPy, $req) | Out-Null       # exactly the locked set, nothing else
-  Run $Uv @('pip', 'install', '--python', $VenvPy, '--no-deps', '-e', (Join-Path $App 'engine')) | Out-Null
-  Remove-Item $req -Force
-
-  # ---- 6 ffmpeg -------------------------------------------------------------------------------------------------
-  Step 6 'ffmpeg' 'ffmpeg 9.0.2 (~100 MB, checksum-verified)'
-  $ff = Join-Path $Tools 'ffmpeg'
-  if ((Test-Path (Join-Path $ff 'bin\ffmpeg.exe')) -and (Test-Path (Join-Path $ff 'bin\ffprobe.exe'))) { Info 'already installed' } else {
+  # ---- 6 ffmpeg ------------------------------------------------------------------------------------------------
+  Step 'ffmpeg' "ffmpeg $FFMPEG_VERSION (~110 MB, checksum-verified)"
+  $ffDir = Join-Path $Tools 'ffmpeg'; $ffVer = Join-Path $ffDir 'VERSION'
+  if ((Test-Path (Join-Path $ffDir 'bin\ffmpeg.exe')) -and (Test-Path (Join-Path $ffDir 'bin\ffprobe.exe'))) {
+    Info 'already installed'
+  } else {
     $z = Join-Path $Dl "$FFMPEG_NAME.zip"
     Download $FFMPEG_URLS $z $FFMPEG_SHA
     $x = Join-Path $Dl 'ffmpeg-x'; Unzip $z $x
-    if (Test-Path $ff) { Remove-Item $ff -Recurse -Force }
-    Move-Item (Get-ChildItem $x | Select-Object -First 1).FullName $ff
-    Remove-Item (Join-Path $ff 'bin\ffplay.exe'), (Join-Path $ff 'doc') -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item $z, $x -Recurse -Force
-  }
-  $env:PATH = (Join-Path $ff 'bin') + ';' + $env:PATH
-
-  # ---- 7 browser ------------------------------------------------------------------------------------------------
-  Step 7 'browser' 'A browser for drawing the graphics'
-  if (Has-Browser) { Info 'Edge or Chrome found: using it' } else {
-    Info 'no Edge or Chrome: downloading Chromium (~350 MB)'
-    Run $VenvPy @('-m', 'playwright', 'install', 'chromium') | Out-Null
+    $inner = Get-ChildItem $x | Select-Object -First 1
+    if (Test-Path $ffDir) { Remove-Item $ffDir -Recurse -Force }
+    Move-Item $inner.FullName $ffDir
+    Remove-Item (Join-Path $ffDir 'bin\ffplay.exe'), (Join-Path $ffDir 'doc') -Recurse -Force -ErrorAction SilentlyContinue  # not used (~100 MB)
+    Set-Content -Path $ffVer -Value $FFMPEG_NAME -Encoding ascii
+    Remove-Item $z, $x -Recurse -Force -ErrorAction SilentlyContinue
   }
 
-  # ---- 8 models -------------------------------------------------------------------------------------------------
-  Step 8 'models' 'AI models: person cut-out (15 MB), speech-to-text (~1.6 GB)'
-  $rvm = Join-Path $PeetHome 'models\rvm_mobilenetv3_fp32.onnx'
-  if (-not (Test-Path $rvm)) { Download @($RVM_URL) $rvm $RVM_SHA } else { Info 'cut-out model already present' }
-  New-Item -ItemType Directory -Force -Path $env:HF_HOME | Out-Null
-  if ($SkipModels) { Info 'speech model skipped (-SkipModels): the first transcribe downloads it' } else {
-    $pyFile = Join-Path $Dl 'whisper.py'
-    Set-Content -Path $pyFile -Encoding ascii -Value @"
+  # ---- 7 chromium ----------------------------------------------------------------------------------------------
+  Step 'browser' 'Chromium for rendering (Playwright, ~350 MB)'
+  Retry { Run $VenvPy @('-m', 'playwright', 'install', 'chromium') } 'chromium download'
+
+  # ---- 8 models ------------------------------------------------------------------------------------------------
+  Step 'models' 'AI models: background matte (~14 MB), face detector (~1 MB), speaker labels (~34 MB), speech-to-text whisper turbo (~1.6 GB)'
+  if ($SkipModels) { Info 'skipped (-SkipModels)' } else {
+    $rvm = Join-Path $Home_ 'models\rvm\rvm_mobilenetv3_fp32.onnx'
+    if (-not (Test-Path $rvm)) { Download $RVM_URL $rvm } else { Info 'RVM already present' }
+    $face = Join-Path $Home_ 'models\mediapipe\blaze_face_short_range.tflite'
+    if (-not (Test-Path $face)) { Download $FACE_URL $face } else { Info 'face model already present' }
+    $yn = Join-Path $Home_ 'models\yunet\face_detection_yunet_2023mar.onnx'
+    if ((Test-Path $yn) -and ((Get-FileHash -Algorithm SHA256 -Path $yn).Hash.ToLower() -ne $YUNET_SHA)) { Remove-Item $yn -Force }
+    if (-not (Test-Path $yn)) { Download $YUNET_URL $yn $YUNET_SHA } else { Info 'YuNet face model already present' }
+    $spk = Join-Path $Home_ 'models\diarize'; New-Item -ItemType Directory -Force -Path $spk | Out-Null
+    $seg = Join-Path $spk 'pyannote-segmentation-3.0.onnx'
+    if (-not (Test-Path $seg)) {
+      $tb = Join-Path $Dl 'spk-seg.tar.bz2'; Download $SPKSEG_URL $tb $SPKSEG_SHA
+      $tx = Join-Path $Dl 'spk-seg'; New-Item -ItemType Directory -Force -Path $tx | Out-Null
+      & tar -xjf $tb -C $tx; if ($LASTEXITCODE -ne 0) { throw 'could not unpack the speaker segmentation model' }
+      $sd = Get-ChildItem $tx -Recurse -Filter model.onnx | Select-Object -First 1
+      Copy-Item $sd.FullName $seg -Force
+      Copy-Item (Join-Path $sd.DirectoryName 'LICENSE') (Join-Path $spk 'pyannote-segmentation-3.0.LICENSE.txt') -Force -ErrorAction SilentlyContinue
+      Remove-Item $tb, $tx -Recurse -Force -ErrorAction SilentlyContinue
+    } else { Info 'speaker segmentation model already present' }
+    $emb = Join-Path $spk 'campplus_sv_en_voxceleb_16k.onnx'
+    if (-not (Test-Path $emb)) { Download $SPKEMB_URL $emb $SPKEMB_SHA } else { Info 'speaker embedding model already present' }
+    Info 'whisper turbo: downloading (resumes if interrupted; this is the long one)'
+    $py = @"
 from huggingface_hub import snapshot_download
-print(snapshot_download('$WHISPER_REPO', allow_patterns=['config.json', 'preprocessor_config.json', 'model.bin', 'tokenizer.json', 'vocabulary.*']))
+p = snapshot_download('$WHISPER_REPO', allow_patterns=['config.json','preprocessor_config.json','model.bin','tokenizer.json','vocabulary.*'])
+print(p)
 "@
-    Info 'speech model: downloading (resumes if interrupted; the long one)'
-    Run $VenvPy @($pyFile) | Out-Null
+    $pyFile = Join-Path $Dl 'prefetch_whisper.py'
+    Set-Content -Path $pyFile -Value $py -Encoding ascii
+    Retry { Run $VenvPy @($pyFile) } 'whisper download'
   }
 
-  # ---- 9 sounds -------------------------------------------------------------------------------------------------
-  Step 9 'sounds' 'Sound packs'
-  if ($SkipSounds) { Info 'skipped (-SkipSounds)' } else {
-    foreach ($p in $rel.sfx) {
-      $mark = Join-Path $PeetHome "sfx\$($p.pack)\.sha256"
-      if ((Test-Path $mark) -and ((Get-Content $mark -Raw).Trim() -eq $p.sha256) -and -not $Update) { Info "$($p.pack): already in place"; continue }
-      $z = Join-Path $Dl $p.file
-      Download @($p.url) $z $p.sha256
-      $x = Join-Path $Dl 'sfx-x'; Unzip $z $x
-      $dst = Join-Path $PeetHome "sfx\$($p.pack)"
-      New-Item -ItemType Directory -Force -Path $dst | Out-Null
-      & robocopy (Join-Path $x $p.pack) $dst /E /NFL /NDL /NJH /NJS /NP | Out-Null  # adds and refreshes; keeps fetched files
-      if ($LASTEXITCODE -ge 8) { throw "could not place the $($p.pack) sounds" }
-      $global:LASTEXITCODE = 0
-      Set-Content $mark $p.sha256 -Encoding ascii
-      Remove-Item $z, $x -Recurse -Force
-      Info "$($p.pack): $($p.sounds) sounds"
+  # ---- 9 sounds: the sound packs the release ships (urfast), through the licence server like the app -------------
+  # The catalogue (app/assets/sfx/catalog.json) names their files as <pack>/...; they unpack into PEET_HOME\sfx\<pack>.
+  Step 'sounds' 'Sound effects (the UR.FastEditor pack, ~660 MB)'
+  $sfxDir = Join-Path $Home_ 'sfx'
+  $packs = @(if ($AppSource -or -not $rel -or -not $rel.gated) { } else { $rel.sfx })  # @(): one pack stays a list (PS 5.1)
+  if (-not $packs.Count) { Info 'no sound packs to install (VEOS sounds download on first use)' }
+  foreach ($p in $packs) {
+    $pd = Join-Path $sfxDir ([string]$p.pack); $mark = Join-Path $pd '.installed'
+    if ((Test-Path $mark) -and ((Get-Content $mark -Raw).Trim() -eq [string]$p.file) -and -not $Update) { Info "$($p.pack): already in place"; continue }
+    $z = Join-Path $Dl ([string]$p.file); $x = Join-Path $Dl 'sfx-x'
+    $refused = Download-Gated $rel $key $z ([string]$p.file)
+    if ($refused) { Info "$($p.pack): the licence server refused it ($($refused.error)); skipped"; Log "sound pack refused: $($refused.error)"; continue }
+    if (Test-Path $x) { Remove-Item $x -Recurse -Force }
+    Unzip $z $x
+    $src = Join-Path $x ([string]$p.pack)
+    if (-not (Test-Path $src)) { throw "the $($p.pack) sound zip has no $($p.pack) folder" }
+    New-Item -ItemType Directory -Force -Path $pd | Out-Null
+    & robocopy $src $pd /E /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "could not place the $($p.pack) sounds (robocopy $LASTEXITCODE)" }
+    $global:LASTEXITCODE = 0
+    Set-Content -Path $mark -Value ([string]$p.file) -Encoding ascii
+    Remove-Item $z, $x -Recurse -Force
+    Info "$($p.pack): installed in $pd"
+  }
+
+  # ---- 10 playbooks --------------------------------------------------------------------------------------------
+  Step 'playbooks' 'Your playbooks folder (templates only; the reference stays read-only in app/)'
+  $pbRoot = Join-Path $Home_ 'playbooks'
+  foreach ($pb in '_template', '_styles') {
+    $s = Join-Path $App "playbooks\$pb"; $t = Join-Path $pbRoot $pb
+    if ((Test-Path $s) -and -not (Test-Path $t)) { Copy-Item -Recurse $s $t; Info "copied $pb" }
+  }
+
+  # ---- 11 skills -----------------------------------------------------------------------------------------------
+  Step 'skills' 'The Peet Edit skills for Claude'
+  $skillsHome = if ($SkillsDir) { $SkillsDir } elseif ($env:CLAUDE_CONFIG_DIR) { Join-Path $env:CLAUDE_CONFIG_DIR 'skills' } else { Join-Path $env:USERPROFILE '.claude\skills' }
+  $plugSrc = Join-Path $App 'plugin'; $plugDst = Join-Path $skillsHome 'peet'
+  $skillsPath = ''
+  if (Test-Path (Join-Path $PSScriptRoot 'channel.json')) { Info 'beta: the skills come with the beta plugin itself' }
+  elseif (-not (Test-Path (Join-Path $plugSrc '.claude-plugin\plugin.json'))) { Info 'this app version carries no skills folder' }
+  else {
+    New-Item -ItemType Directory -Force -Path $plugDst | Out-Null
+    & robocopy $plugSrc $plugDst /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "could not copy the skills to $plugDst (robocopy $LASTEXITCODE)" }
+    $global:LASTEXITCODE = 0
+    $skillsPath = $plugDst
+    Info "skills installed at $plugDst (start a new Claude session to use them)"
+  }
+
+  # ---- 12 doctor -----------------------------------------------------------------------------------------------
+  Step 'doctor' 'Putting peet on your PATH, then checking everything with peet doctor'
+  $bin = Install-PeetWrapper $Home_
+  if (Add-UserPath $bin) { Info "added $bin to your user PATH (new terminals know 'peet')" } else { Info "peet already on your user PATH ($bin)" }
+  if ((-not $ExplicitHome) -and ($Home_ -ne $LegacyHome) -and (Remove-UserPath (Join-Path $LegacyHome 'bin'))) {
+    Info "removed the old folder's peet ($LegacyHome\bin) from your user PATH"
+  }
+  $env:PATH = $bin + ';' + (Join-Path $Home_ 'tools\ffmpeg\bin') + ';' + $env:PATH
+  $licExtra = @{}
+  if ($licPending) {
+    Info 'activating your licence (second try)'
+    $le = Invoke-Licence
+    if ($le) {
+      $lm = if ($le.code -eq 'LICENCE_OFFLINE') { "Everything is installed, but the licence server couldn't be reached, so the licence isn't activated yet. Check the internet connection, then run /peet:setup licence." } else { $le.message }
+      Info $lm; Log "licence still not activated: $($le.code)"
+      $licExtra = @{ licence_pending = $true; licence_error = $le.code; licence_message = $lm }
     }
   }
-
-  # ---- 10 skills ------------------------------------------------------------------------------------------------
-  Step 10 'skills' 'The Peet Edit skills for Claude'
-  New-Item -ItemType Directory -Force -Path (Join-Path $PeetHome 'playbooks') | Out-Null
-  $dst = Join-Path $SkillsDir 'peet'
-  New-Item -ItemType Directory -Force -Path $dst | Out-Null
-  & robocopy (Join-Path $App 'plugin') $dst /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
-  if ($LASTEXITCODE -ge 8) { throw "could not copy the skills to $dst" }
+  $doc = & $VenvPy -m peet doctor
   $global:LASTEXITCODE = 0
-  $default = Join-Path $env:USERPROFILE 'PeetEdit'
-  if ($PeetHome -ne $default) {  # a home elsewhere: the skills' wrappers must find it without PEET_HOME
-    $cmd = Join-Path $dst 'bin\peet.cmd'
-    (Get-Content -Raw $cmd).Replace('set "H=%USERPROFILE%\PeetEdit"', "set ""H=$PeetHome""") | Set-Content -NoNewline -Encoding ascii $cmd
-    $sh = Join-Path $dst 'bin\peet'
-    $posix = '/' + $PeetHome.Substring(0, 1).ToLower() + $PeetHome.Substring(2).Replace('\', '/')
-    $t = (Get-Content -Raw $sh).Replace('H="${PEET_HOME:-$HOME/PeetEdit}"', "H=""`${PEET_HOME:-$posix}""")
-    [IO.File]::WriteAllText($sh, $t.Replace("`r`n", "`n"))
-  }
-  Info "skills at $dst (start a new Claude session to use them)"
+  $ready = $false; $problems = @()
+  try { $j = ($doc | Out-String) | ConvertFrom-Json; $ready = [bool]$j.ready; $problems = @($j.problems) } catch { $problems = @("doctor output unreadable: $doc") }
+  Info $(if ($ready) { 'doctor: ready' } else { 'doctor: problems found' })
+  Remove-Item $Dl -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item (Join-Path $Home_ 'cache') -Recurse -Force -ErrorAction SilentlyContinue  # uv download cache (~800 MB), not needed after install
+  Remove-Item (Join-Path $Home_ 'tmp\*') -Recurse -Force -ErrorAction SilentlyContinue
 
-  # ---- 11 doctor ------------------------------------------------------------------------------------------------
-  Step 11 'doctor' "Putting peet on your PATH and checking everything"
-  $bin = Join-Path $PeetHome 'bin'
-  New-Item -ItemType Directory -Force -Path $bin | Out-Null
-  Copy-Item (Join-Path $dst 'bin\peet.cmd') (Join-Path $bin 'peet.cmd') -Force
-  $up = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if (-not (($up -split ';') -contains $bin)) {
-    [Environment]::SetEnvironmentVariable('Path', ((@($up, $bin) | Where-Object { $_ }) -join ';'), 'User')
-    Info "added $bin to your PATH (new terminals know 'peet')"
-  }
-  $r = Native (Join-Path $bin 'peet.cmd') @('doctor')
-  $d = ($r.out | Where-Object { $_ -match '^\{' } | Select-Object -Last 1) | ConvertFrom-Json
-  Remove-Item (Join-Path $PeetHome 'scratch') -Recurse -Force -ErrorAction SilentlyContinue
-  if (-not $env:PEET_UV_CACHE) { Remove-Item $env:UV_CACHE_DIR -Recurse -Force -ErrorAction SilentlyContinue }  # ~1 GB, not needed after
-  $size = (Get-ChildItem $PeetHome -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-  Finish $true @{ version = $rel.version; doctor_ready = [bool]$d.ready; problems = @($d.problems); checks = $d.checks
-                  skills = $dst; size_mb = [int]($size / 1MB); gpu = $gpu }
+  $size = (Get-ChildItem $Home_ -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+  Finish $true (@{ doctor_ready = $ready; problems = $problems; size_mb = [int]($size / 1MB); app = $App; venv = $Venv; skills = $skillsPath } + $licExtra)
 } catch {
   $msg = $_.Exception.Message
   Log "FAILED at $script:Step : $msg"
   Write-Host "FAILED at step '$script:Step': $msg"
-  Finish $false @{ step = $script:Step; error = $msg; hint = $hint[$script:Step] }
+  $h = if ($script:NetHint) { $script:NetHint } else { $hint[$script:Step] }
+  Finish $false @{ step = $script:Step; error = $msg; hint = $h }
 }
